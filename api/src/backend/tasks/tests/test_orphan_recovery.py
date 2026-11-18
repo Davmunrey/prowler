@@ -4,6 +4,7 @@ from uuid import uuid4
 
 import pytest
 from api.celery_utils import decode_celery_field
+from api.models import Scan, StateChoices, Task
 from celery import states
 from celery.utils.saferepr import saferepr
 from django.test import override_settings
@@ -291,13 +292,12 @@ class TestReconcileTaskResults:
     @pytest.mark.parametrize(
         "task_name",
         [
-            "scan-perform",
             "attack-paths-scan-perform",
             "attack-paths-cleanup-stale-scans",
         ],
     )
     def test_scan_task_is_skipped_entirely(self, tenants_fixture, task_name):
-        """Scan tasks are excluded from recovery: the watchdog never touches them."""
+        """Attack Paths scan tasks are excluded: the watchdog never touches them."""
         tr = _orphan_result(
             name=task_name,
             kwargs={
@@ -317,6 +317,158 @@ class TestReconcileTaskResults:
         assert tr.task_id not in result["failed"]
         assert tr.task_id not in result["skipped"]
         mock_task.apply_async.assert_not_called()
+
+    def _orphaned_scan(self, tenant, provider, task_name, state):
+        """A scan whose task a dead worker left in flight, plus the next queued scan."""
+        kwargs = {"tenant_id": str(tenant.id), "provider_id": str(provider.id)}
+        orphan = _orphan_result(
+            name=task_name,
+            kwargs=kwargs,
+            worker="dead@gone",
+            created_minutes_ago=60,
+        )
+        stuck_scan = Scan.objects.create(
+            tenant_id=tenant.id,
+            provider=provider,
+            name="Stuck scan",
+            trigger=Scan.TriggerChoices.MANUAL,
+            state=state,
+            task=Task.objects.create(
+                id=orphan.task_id, task_runner_task=orphan, tenant_id=tenant.id
+            ),
+        )
+        queued_result = TaskResult.objects.create(
+            task_id=str(uuid4()), task_name="scan-perform", status="QUEUED"
+        )
+        queued_scan = Scan.objects.create(
+            tenant_id=tenant.id,
+            provider=provider,
+            name="Queued scan",
+            trigger=Scan.TriggerChoices.MANUAL,
+            state=StateChoices.AVAILABLE,
+            task=Task.objects.create(
+                id=queued_result.task_id,
+                task_runner_task=queued_result,
+                tenant_id=tenant.id,
+            ),
+        )
+        return orphan, stuck_scan, queued_scan
+
+    @pytest.mark.parametrize(
+        "task_name, state",
+        [
+            ("scan-perform", StateChoices.EXECUTING),
+            ("scan-perform-scheduled", StateChoices.EXECUTING),
+            ("scan-perform", StateChoices.AVAILABLE),
+        ],
+    )
+    def test_orphaned_scan_is_closed_and_the_next_queued_scan_dispatched(
+        self,
+        tenants_fixture,
+        aws_provider,
+        django_capture_on_commit_callbacks,
+        task_name,
+        state,
+    ):
+        """An orphaned scan is never re-run: it is failed and the queue advances."""
+        tenant = tenants_fixture[0]
+        orphan, stuck_scan, queued_scan = self._orphaned_scan(
+            tenant, aws_provider, task_name, state
+        )
+        p_alive, p_revoke, p_app, mock_task = self._patches(alive=False)
+        with (
+            p_alive,
+            p_revoke,
+            p_app,
+            patch("tasks.tasks.perform_scan_task.apply_async") as mock_dispatch,
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            result = _reconcile_task_results(
+                grace_minutes=2, max_attempts=3, window_hours=6, dry_run=False
+            )
+
+        assert orphan.task_id in result["failed"]
+        assert orphan.task_id not in result["recovered"]
+        mock_task.apply_async.assert_not_called()  # the orphan itself is not re-run
+        orphan.refresh_from_db()
+        assert orphan.status == states.REVOKED
+        stuck_scan.refresh_from_db()
+        assert stuck_scan.state == StateChoices.FAILED
+        assert stuck_scan.completed_at is not None
+        queued_scan.refresh_from_db()
+        assert queued_scan.state == StateChoices.AVAILABLE
+        assert queued_scan.task.task_runner_task.status == states.PENDING
+        mock_dispatch.assert_called_once_with(
+            kwargs={
+                "tenant_id": str(tenant.id),
+                "scan_id": str(queued_scan.id),
+                "provider_id": str(aws_provider.id),
+            },
+            task_id=str(queued_scan.task_id),
+        )
+
+    @pytest.mark.parametrize("alive, dry_run", [(True, False), (False, True)])
+    def test_scan_on_a_live_worker_or_in_a_dry_run_is_left_running(
+        self,
+        tenants_fixture,
+        aws_provider,
+        django_capture_on_commit_callbacks,
+        alive,
+        dry_run,
+    ):
+        """A scan still in flight, or a dry run, changes no scan and dispatches none."""
+        tenant = tenants_fixture[0]
+        orphan, stuck_scan, queued_scan = self._orphaned_scan(
+            tenant, aws_provider, "scan-perform", StateChoices.EXECUTING
+        )
+        p_alive, p_revoke, p_app, _ = self._patches(alive=alive)
+        with (
+            p_alive,
+            p_revoke,
+            p_app,
+            patch("tasks.tasks.perform_scan_task.apply_async") as mock_dispatch,
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            result = _reconcile_task_results(
+                grace_minutes=2, max_attempts=3, window_hours=6, dry_run=dry_run
+            )
+
+        assert orphan.task_id not in result["failed"]
+        orphan.refresh_from_db()
+        assert orphan.status == states.STARTED
+        stuck_scan.refresh_from_db()
+        assert stuck_scan.state == StateChoices.EXECUTING
+        queued_scan.refresh_from_db()
+        assert queued_scan.task.task_runner_task.status == "QUEUED"
+        mock_dispatch.assert_not_called()
+
+    def test_orphaned_scan_without_a_provider_in_its_kwargs_closes_no_scan(
+        self, tenants_fixture, aws_provider, django_capture_on_commit_callbacks
+    ):
+        """Without the tenant and provider the scan cannot be found: nothing is guessed."""
+        tenant = tenants_fixture[0]
+        orphan, stuck_scan, _ = self._orphaned_scan(
+            tenant, aws_provider, "scan-perform", StateChoices.EXECUTING
+        )
+        TaskResult.objects.filter(pk=orphan.pk).update(
+            task_kwargs=repr({"tenant_id": str(tenant.id)})
+        )
+        p_alive, p_revoke, p_app, _ = self._patches(alive=False)
+        with (
+            p_alive,
+            p_revoke,
+            p_app,
+            patch("tasks.tasks.perform_scan_task.apply_async") as mock_dispatch,
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            result = _reconcile_task_results(
+                grace_minutes=2, max_attempts=3, window_hours=6, dry_run=False
+            )
+
+        assert orphan.task_id in result["failed"]
+        stuck_scan.refresh_from_db()
+        assert stuck_scan.state == StateChoices.EXECUTING
+        mock_dispatch.assert_not_called()
 
     def test_jira_integration_task_is_not_reenqueued(self, tenants_fixture):
         """integration-jira stays terminal: re-running it would create duplicate Jira

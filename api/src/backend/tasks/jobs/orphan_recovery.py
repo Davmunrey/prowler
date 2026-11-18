@@ -14,6 +14,10 @@ the task starts, but external side-effect tasks are failed instead of blindly
 re-run. A small recovery cap stops a task that repeatedly kills its worker from
 looping forever.
 
+Scan tasks are never re-run. An orphaned one is closed: its scan is marked failed
+and the provider's next queued scan is dispatched, which otherwise only the
+finishing scan task does.
+
 This is the shared engine behind both the periodic Beat watchdog and the
 `reconcile_orphan_tasks` management command.
 """
@@ -75,13 +79,14 @@ def reenqueueable_tasks() -> set[str]:
     }
 
 
-# Tasks the watchdog ignores entirely (not even marked terminal): scan tasks are not
-# auto-recovered, since re-running a scan is not safe to do automatically; attack-paths
-# scans are handled by their own stale-cleanup (which also drops the temp Neo4j db);
-# and the maintenance tasks must not self-recover (they run again on their own schedule).
+# Scan tasks are not auto-recovered, since re-running a scan would duplicate findings.
+# Their orphans are closed instead, see `_close_orphaned_scan`.
+SCAN_TASKS = {"scan-perform", "scan-perform-scheduled"}
+
+# Tasks the watchdog ignores entirely (not even marked terminal): attack-paths scans
+# are handled by their own stale-cleanup (which also drops the temp Neo4j db), and the
+# maintenance tasks must not self-recover (they run again on their own schedule).
 _SKIP_RECOVERY = {
-    "scan-perform",
-    "scan-perform-scheduled",
     "attack-paths-scan-perform",
     "attack-paths-cleanup-stale-scans",
     "attack-paths-reap-orphaned-tmp-databases",
@@ -237,6 +242,54 @@ def _recovery_attempt_count(name: str, kwargs_repr, window_hours: int) -> int:
         return 1
 
 
+def _close_orphaned_scan(task_id: str, kwargs_repr) -> None:
+    """Mark the scan of an orphaned scan task failed and dispatch the next queued one.
+
+    A scan row left `EXECUTING` by a dead worker counts as the provider's running
+    scan forever, so every later scan for that provider stays queued.
+    """
+    from api.db_utils import rls_transaction
+    from api.models import Scan, StateChoices
+    from tasks.tasks import _dispatch_next_queued_provider_scan_best_effort
+
+    try:
+        kwargs = decode_celery_field(kwargs_repr, {})
+    except ValueError:
+        kwargs = None
+    tenant_id = kwargs.get("tenant_id") if isinstance(kwargs, dict) else None
+    provider_id = kwargs.get("provider_id") if isinstance(kwargs, dict) else None
+    if not tenant_id or not provider_id:
+        logger.error(
+            "Orphan scan task %s: stored kwargs name no tenant and provider, "
+            "its scan was not closed",
+            task_id,
+        )
+        return
+
+    with rls_transaction(tenant_id):
+        scans = Scan.objects.select_for_update().filter(
+            tenant_id=tenant_id,
+            provider_id=provider_id,
+            task_id=task_id,
+            state__in=(
+                StateChoices.AVAILABLE,
+                StateChoices.SCHEDULED,
+                StateChoices.EXECUTING,
+            ),
+        )
+        for scan in scans:
+            scan.state = StateChoices.FAILED
+            scan.completed_at = datetime.now(tz=UTC)
+            scan.save(update_fields=["state", "completed_at", "updated_at"])
+            logger.warning(
+                "Orphan scan task %s: marked scan %s failed for provider %s",
+                task_id,
+                scan.id,
+                provider_id,
+            )
+    _dispatch_next_queued_provider_scan_best_effort(tenant_id, provider_id)
+
+
 def _recover_task(task_result, max_attempts: int, window_hours: int) -> str:
     """Recover one orphaned task. Returns 'recovered' or 'failed'."""
     # Capture name/args/kwargs now: revoking can let a worker blank the row.
@@ -252,6 +305,10 @@ def _recover_task(task_result, max_attempts: int, window_hours: int) -> str:
     task_result.status = states.REVOKED
     task_result.date_done = now
     task_result.save(update_fields=["status", "date_done"])
+
+    if name in SCAN_TASKS:
+        _close_orphaned_scan(task_result.task_id, kwargs_repr)
+        return "failed"
 
     if name not in reenqueueable_tasks():
         logger.warning(

@@ -5,7 +5,8 @@ task it was running can be left non-terminal forever: the `TaskResult` stays
 `STARTED` and nothing re-runs it. This page describes the mechanisms that detect and
 recover allowlisted idempotent orphans so pending-task alerts do not fire. Scan tasks
 are not auto-recovered (re-running a scan is not safe to do automatically); the
-watchdog covers the summary/aggregation and deletion tasks.
+watchdog re-runs the summary/aggregation and deletion tasks. An orphaned scan is
+closed instead: it is marked failed and the provider's next queued scan is dispatched.
 
 ## How recovery works
 
@@ -34,10 +35,15 @@ watchdog covers the summary/aggregation and deletion tasks.
 
    The re-run is safe because only tasks with proven idempotency are allowlisted: the
    summary/aggregation tasks clear and re-write their own rows, and deletions are
-   idempotent. Scan tasks and external side effects are excluded: re-running a scan is
-   not safe to do automatically, Jira sends would create duplicate issues, the S3
-   upload rebuilds from worker-local files that do not survive a crash, and
+   idempotent. Scan tasks and external side effects are never re-run: re-running a
+   scan is not safe to do automatically, Jira sends would create duplicate issues, the
+   S3 upload rebuilds from worker-local files that do not survive a crash, and
    report/Security Hub recovery is out of scope.
+
+   An orphaned `scan-perform` or `scan-perform-scheduled` task is revoked and marked
+   terminal, its scan is marked `FAILED`, and the provider's next queued scan is
+   dispatched. Only the finishing scan task dispatches that queue, so a scan left
+   `EXECUTING` by a dead worker would otherwise hold every later scan for the provider.
 
 3. **Recovery cap.** A per-task Valkey counter limits how often the same task is
    re-enqueued. After `--max-attempts` recoveries (default 3) the orphan is marked
